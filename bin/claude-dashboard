@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Claude Code live usage dashboard using rich."""
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+STATS_FILE   = os.path.expanduser("~/.claude/stats-cache.json")
+HISTORY_FILE = os.path.expanduser("~/.claude/history.jsonl")
+LIMIT_5H     = int(os.environ.get("CLAUDE_LIMIT_5H",  "45"))
+LIMIT_5DAY   = int(os.environ.get("CLAUDE_LIMIT_5DAY", "225"))
+
+console = Console()
+
+def fmt_tokens(n):
+    if n >= 1_000_000: return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:     return f"{n/1_000:.1f}K"
+    return str(n)
+
+def load_data():
+    try:
+        with open(STATS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+def window_data(hours=None, days=None):
+    now_ms = time.time() * 1000
+    cutoff = now_ms - (hours * 3600 if hours else days * 86400) * 1000
+    count, oldest = 0, None
+    try:
+        with open(HISTORY_FILE) as f:
+            for line in f:
+                ts = json.loads(line).get("timestamp", 0)
+                if isinstance(ts, (int, float)) and ts >= cutoff:
+                    count += 1
+                    if oldest is None or ts < oldest:
+                        oldest = ts
+    except Exception:
+        pass
+    return count, oldest
+
+def fmt_reset(oldest_ms, window_hours):
+    if oldest_ms is None:
+        return "clear"
+    secs_left = oldest_ms / 1000 + window_hours * 3600 - time.time()
+    if secs_left <= 0:
+        return "clear"
+    if window_hours >= 24:
+        d = int(secs_left // 86400)
+        h = int((secs_left % 86400) // 3600)
+        return f"{d}d {h}h" if d else f"{h}h {int((secs_left%3600)//60)}m"
+    h = int(secs_left // 3600)
+    m = int((secs_left % 3600) // 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+def limit_bar(used, total, width=24):
+    p      = min(used / total, 1.0) if total else 0
+    filled = round(p * width)
+    pct    = int(p * 100)
+    color  = "red" if pct >= 85 else "yellow" if pct >= 60 else "green"
+    bar    = f"[{color}]" + "█" * filled + f"[/][dim]" + "░" * (width - filled) + "[/]"
+    return Text.from_markup(f"  {bar} [bold]{pct}%[/]  {used}/{total} msgs")
+
+def make_limits_panel(msgs5h, oldest5h, msgs5d, oldest5d):
+    r5h = fmt_reset(oldest5h, 5)
+    r5d = fmt_reset(oldest5d, 120)
+    content = Text.assemble(("5-Hour Window\n", "bold white"))
+    content.append_text(limit_bar(msgs5h, LIMIT_5H))
+    content.append(f"\n  Resets in: ", "dim")
+    content.append(r5h, "bold yellow")
+    content.append("\n\n")
+    content.append("5-Day Window\n", "bold white")
+    content.append_text(limit_bar(msgs5d, LIMIT_5DAY))
+    content.append(f"\n  Resets in: ", "dim")
+    content.append(r5d, "bold yellow")
+    content.append(
+        f"\n\n[dim]Limits: {LIMIT_5H}/5h · {LIMIT_5DAY}/5day\n"
+        f"Set CLAUDE_LIMIT_5H / CLAUDE_LIMIT_5DAY to override[/]"
+    )
+    return Panel(content, title="[bold red]Usage Limits[/bold red]", border_style="red")
+
+def make_activity_table(data):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = data.get("dailyActivity", [])[-7:]
+    table = Table(title="Daily Activity (last 7 days)", border_style="bright_blue", expand=True)
+    table.add_column("Date",       style="cyan",    no_wrap=True)
+    table.add_column("Messages",   justify="right", style="green")
+    table.add_column("Sessions",   justify="right", style="yellow")
+    table.add_column("Tool Calls", justify="right", style="magenta")
+    for day in reversed(daily):
+        is_today = day["date"] == today
+        style    = "bold white on dark_blue" if is_today else ""
+        label    = f"[bold]{day['date']} ◀ today[/bold]" if is_today else day["date"]
+        table.add_row(label,
+            str(day["messageCount"]),
+            str(day["sessionCount"]),
+            str(day["toolCallCount"]),
+            style=style,
+        )
+    return table
+
+def make_token_panel(data):
+    model_usage = data.get("modelUsage", {})
+    if not model_usage:
+        return Panel("No token data yet.", title="Token Usage")
+    rows = []
+    for model, stats in model_usage.items():
+        short   = model.replace("claude-", "").replace("-latest", "")
+        inp     = stats.get("inputTokens", 0)
+        out     = stats.get("outputTokens", 0)
+        cache_r = stats.get("cacheReadInputTokens", 0)
+        cache_w = stats.get("cacheCreationInputTokens", 0)
+        cost    = stats.get("costUSD", 0)
+        total_in = inp + cache_r + cache_w
+        hit_pct  = int(cache_r / total_in * 100) if total_in else 0
+        bar_f    = hit_pct // 5
+        bar      = "[green]" + "█" * bar_f + "[dim]" + "░" * (20 - bar_f) + "[/]"
+        rows.append(Text.assemble(
+            ("Model : ", "dim"), (short, "bold cyan"), "\n",
+            ("  Input      : ", "dim"), (fmt_tokens(inp),     "green"),    "\n",
+            ("  Output     : ", "dim"), (fmt_tokens(out),     "yellow"),   "\n",
+            ("  Cache read : ", "dim"), (fmt_tokens(cache_r), "magenta"),  "\n",
+            ("  Cache write: ", "dim"), (fmt_tokens(cache_w), "blue"),     "\n",
+        ))
+        rows.append(Text.from_markup(f"  Cache hit  : {bar} {hit_pct}%"))
+        if cost:
+            rows.append(Text.assemble(("  Cost: ", "dim"), (f"${cost:.4f}", "bold red")))
+    content = Text("\n").join(rows)
+    return Panel(content, title="[bold]Token Usage[/bold]", border_style="green")
+
+def make_totals_panel(data):
+    longest      = data.get("longestSession", {})
+    longest_mins = longest.get("duration", 0) // 60000
+    longest_msgs = longest.get("messageCount", 0)
+    first        = data.get("firstSessionDate", "")[:10]
+    last_updated = data.get("lastComputedDate", "unknown")
+    content = Text.assemble(
+        ("Total Sessions : ", "dim"), (str(data.get("totalSessions", 0)), "bold cyan"), "\n",
+        ("Total Messages : ", "dim"), (str(data.get("totalMessages",  0)), "bold cyan"), "\n",
+        ("Longest Session: ", "dim"), (f"{longest_mins} min, {longest_msgs} msgs", "yellow"), "\n",
+        ("Using since    : ", "dim"), (first,        "green"),   "\n",
+        ("\nFile updated   : ", "dim"), (last_updated, "magenta"),
+    )
+    return Panel(content, title="[bold]Totals[/bold]", border_style="yellow")
+
+def make_header(interval, remaining):
+    now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+    return Panel(
+        Text.from_markup(
+            f"[bold cyan]Claude Code Usage Dashboard[/bold cyan]"
+            f"   [dim]{now}[/dim]"
+            f"   [yellow]Next refresh in {remaining:2}s[/yellow]"
+            f"   [dim]Ctrl+C to stop[/dim]"
+        ),
+        border_style="bright_blue",
+    )
+
+def build_layout(data, msgs5h, oldest5h, msgs5d, oldest5d, interval, remaining):
+    layout = Layout()
+    layout.split_column(
+        Layout(make_header(interval, remaining), size=3),
+        Layout(name="body"),
+    )
+    layout["body"].split_row(
+        Layout(name="left"),
+        Layout(name="right"),
+    )
+    layout["left"].split_column(
+        Layout(make_limits_panel(msgs5h, oldest5h, msgs5d, oldest5d), size=15),
+        Layout(make_activity_table(data)),
+    )
+    layout["right"].split_column(
+        Layout(make_token_panel(data)),
+        Layout(make_totals_panel(data)),
+    )
+    return layout
+
+def main():
+    args = sys.argv[1:]
+    try:
+        interval = int(args[0]) if args else 30
+    except ValueError:
+        interval = 30
+
+    data = load_data()
+    if not data:
+        console.print("[red]No Claude stats found.[/red]  Run Claude Code first.")
+        sys.exit(1)
+
+    msgs5h, oldest5h = window_data(hours=5)
+    msgs5d, oldest5d = window_data(days=5)
+
+    try:
+        with Live(
+            build_layout(data, msgs5h, oldest5h, msgs5d, oldest5d, interval, interval),
+            refresh_per_second=1,
+            screen=True,
+        ) as live:
+            elapsed = 0
+            while True:
+                remaining = interval - (elapsed % interval)
+                if elapsed % interval == 0 and elapsed > 0:
+                    data   = load_data() or data
+                    msgs5h, oldest5h = window_data(hours=5)
+                    msgs5d, oldest5d = window_data(days=5)
+                live.update(build_layout(data, msgs5h, oldest5h, msgs5d, oldest5d, interval, remaining))
+                time.sleep(1)
+                elapsed += 1
+    except KeyboardInterrupt:
+        console.print("\n[dim]Dashboard stopped.[/dim]")
+
+if __name__ == "__main__":
+    main()

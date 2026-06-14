@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""One-line status for Claude Code status bar."""
+
+import json, os, time
+
+STATS_FILE   = os.path.expanduser("~/.claude/stats-cache.json")
+HISTORY_FILE = os.path.expanduser("~/.claude/history.jsonl")
+LIMIT_5H     = int(os.environ.get("CLAUDE_LIMIT_5H",  "45"))
+LIMIT_5DAY   = int(os.environ.get("CLAUDE_LIMIT_5DAY", "225"))
+
+def bar(used, total, width=10):
+    p = min(used / total, 1.0) if total else 0
+    f = round(p * width)
+    return "█" * f + "░" * (width - f)
+
+def window_data(hours=None, days=None):
+    """Return (count, oldest_ts_ms) for messages within the window."""
+    now_ms = time.time() * 1000
+    cutoff = now_ms - (hours * 3600 if hours else days * 86400) * 1000
+    count, oldest = 0, None
+    try:
+        with open(HISTORY_FILE) as f:
+            for line in f:
+                ts = json.loads(line).get("timestamp", 0)
+                if isinstance(ts, (int, float)) and ts >= cutoff:
+                    count += 1
+                    if oldest is None or ts < oldest:
+                        oldest = ts
+    except Exception:
+        pass
+    return count, oldest
+
+def fmt_reset(oldest_ms, window_hours):
+    """How long until oldest message ages out of window."""
+    if oldest_ms is None:
+        return "clear"
+    resets_at = oldest_ms / 1000 + window_hours * 3600
+    secs_left = resets_at - time.time()
+    if secs_left <= 0:
+        return "clear"
+    if window_hours >= 24:
+        d = int(secs_left // 86400)
+        h = int((secs_left % 86400) // 3600)
+        return f"{d}d{h}h" if d else f"{h}h{int((secs_left%3600)//60)}m"
+    h = int(secs_left // 3600)
+    m = int((secs_left % 3600) // 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+try:
+    data  = json.load(open(STATS_FILE))
+    total = data.get("totalMessages", 0)
+except Exception:
+    total = 0
+
+msgs5h,  oldest5h  = window_data(hours=5)
+msgs5d,  oldest5d  = window_data(days=5)
+pct5h  = int(msgs5h  / LIMIT_5H   * 100) if LIMIT_5H   else 0
+pct5d  = int(msgs5d  / LIMIT_5DAY * 100) if LIMIT_5DAY else 0
+r5h    = fmt_reset(oldest5h,  5)
+r5d    = fmt_reset(oldest5d, 120)  # 5 days = 120 hours
+
+print(f"5h: {pct5h}% [{bar(msgs5h,LIMIT_5H)}] rst:{r5h} | 5d: {pct5d}% [{bar(msgs5d,LIMIT_5DAY)}] rst:{r5d} | msgs:{total}")

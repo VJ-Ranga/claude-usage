@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Quick Claude Code usage summary from local stats cache."""
+
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+
+STATS_FILE = os.path.expanduser("~/.claude/stats-cache.json")
+
+def fmt_tokens(n):
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(n)
+
+def show(interval=None):
+    try:
+        with open(STATS_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print("No Claude stats found at", STATS_FILE)
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    last_computed = data.get("lastComputedDate", "unknown")
+    now_str = datetime.now().strftime("%H:%M:%S")
+
+    print("=" * 46)
+    print(f"  Claude Code Usage  [{now_str}]")
+    if interval:
+        print(f"  Refreshing every {interval}s  (Ctrl+C to stop)")
+    print("=" * 46)
+
+    daily = data.get("dailyActivity", [])
+    if daily:
+        print("\nRecent Daily Activity:")
+        for day in daily[-7:]:
+            marker = " <-- today" if day["date"] == today else ""
+            print(f"  {day['date']}  msgs={day['messageCount']:3}  sessions={day['sessionCount']}  tools={day['toolCallCount']}{marker}")
+
+    model_usage = data.get("modelUsage", {})
+    if model_usage:
+        print("\nToken Usage (all time):")
+        for model, stats in model_usage.items():
+            short = model.replace("claude-", "").replace("-latest", "")
+            inp     = fmt_tokens(stats.get("inputTokens", 0))
+            out     = fmt_tokens(stats.get("outputTokens", 0))
+            cache_r = fmt_tokens(stats.get("cacheReadInputTokens", 0))
+            cache_w = fmt_tokens(stats.get("cacheCreationInputTokens", 0))
+            cost    = stats.get("costUSD", 0)
+            print(f"  {short}")
+            print(f"    input={inp}  output={out}  cache_read={cache_r}  cache_write={cache_w}")
+            if cost:
+                print(f"    cost=${cost:.4f}")
+
+    print(f"\nTotals:")
+    print(f"  Sessions : {data.get('totalSessions', 0)}")
+    print(f"  Messages : {data.get('totalMessages', 0)}")
+    longest = data.get("longestSession", {})
+    if longest:
+        mins = longest.get("duration", 0) // 60000
+        print(f"  Longest session: {mins} min, {longest.get('messageCount', 0)} messages")
+
+    first = data.get("firstSessionDate", "")
+    if first:
+        print(f"  Using since: {first[:10]}")
+
+    print(f"\n  Stats last updated: {last_computed}")
+    print("=" * 46)
+
+def main():
+    interval = None
+    args = sys.argv[1:]
+
+    if args and args[0] in ("-w", "--watch"):
+        try:
+            interval = int(args[1]) if len(args) > 1 else 30
+        except ValueError:
+            interval = 30
+
+    if interval:
+        try:
+            while True:
+                os.system("clear")
+                show(interval)
+                # countdown
+                for remaining in range(interval, 0, -1):
+                    sys.stdout.write(f"\r  Next refresh in {remaining:2}s ... ")
+                    sys.stdout.flush()
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n\nStopped.")
+    else:
+        show()
+
+if __name__ == "__main__":
+    main()
