@@ -38,12 +38,18 @@ def bar(pct, width=10):
     filled = round(min(pct, 100) / 100 * width)
     return "█" * filled + "░" * (width - filled)
 
-def fmt_reset(ts):
+def fmt_reset(ts, window_hours=None):
     if not ts:
         return "?"
     secs = ts - time.time()
     if secs <= 0:
-        return "now"
+        # Window has reset — estimate next reset from window size
+        if window_hours:
+            secs = window_hours * 3600 + secs  # secs is negative, so this = time into new window remaining
+            if secs <= 0:
+                return "soon"
+        else:
+            return "reset!"
     h = int(secs // 3600)
     m = int((secs % 3600) // 60)
     if h >= 24:
@@ -58,9 +64,12 @@ def count_msgs(hours):
     try:
         with open(HISTORY_FILE) as f:
             for line in f:
-                ts = json.loads(line).get("timestamp", 0)
+                obj = json.loads(line)
+                ts = obj.get("timestamp", 0)
+                display = obj.get("display", "")
                 if isinstance(ts, (int, float)) and ts >= cutoff:
-                    n += 1
+                    if not display.startswith("/"):  # skip slash commands
+                        n += 1
     except Exception:
         pass
     return n
@@ -88,8 +97,8 @@ try:
     limits   = json.load(open(LIMITS_FILE))
     pct5h, used5h, cap5h, est5h = estimate("5h", 5,     limits)
     pct7d, used7d, cap7d, est7d = estimate("7d", 24*7,  limits)
-    rst5h = fmt_reset(limits["5h"]["reset"])
-    rst7d = fmt_reset(limits["7d"]["reset"])
+    rst5h = fmt_reset(limits["5h"]["reset"], window_hours=5)
+    rst7d = fmt_reset(limits["7d"]["reset"], window_hours=24*7)
     tag = "~"
     cnt5h = f"{pct5h}%({used5h}/{cap5h})" if cap5h else f"{pct5h}%"
     cnt7d = f"{pct7d}%({used7d}/{cap7d})" if cap7d else f"{pct7d}%"

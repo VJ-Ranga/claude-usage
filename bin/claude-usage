@@ -170,7 +170,8 @@ def parse_status(text):
         try:
             msgs = sum(1 for line in open(
                 os.path.expanduser("~/.claude/history.jsonl"))
-                if json.loads(line).get("timestamp", 0) >= cutoff)
+                if json.loads(line).get("timestamp", 0) >= cutoff
+                and not json.loads(line).get("display", "").startswith("/"))
         except Exception:
             msgs = 0
         if util > 0.001 and msgs > 0:
@@ -234,7 +235,8 @@ def set_manual(args):
         try:
             msgs = sum(1 for line in open(
                 os.path.expanduser("~/.claude/history.jsonl"))
-                if json.loads(line).get("timestamp", 0) >= cutoff)
+                if json.loads(line).get("timestamp", 0) >= cutoff
+                and not json.loads(line).get("display", "").startswith("/"))
         except Exception:
             msgs = 0
         if util > 0.001 and msgs > 0:
