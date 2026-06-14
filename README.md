@@ -1,6 +1,40 @@
 # claude-usage
 
-> Live usage monitor for [Claude Code](https://claude.ai/code) — terminal dashboard, status bar, and MCP plugin showing token usage, message counts, and 5h/5day limit progress with reset timers.
+> Live usage monitor for [Claude Code](https://claude.ai/code) — terminal dashboard, status bar, and MCP plugin showing token usage, message counts, and 5h/7day limit progress with reset timers.
+
+---
+
+## ⚠️ IMPORTANT SECURITY & TERMS OF SERVICE WARNING ⚠️
+
+> **READ THIS BEFORE USING THE API REFRESH FEATURE**
+
+The `claude-fetch-limits` script works by:
+
+1. **Reading your internal Claude Code OAuth token** from `~/.claude/.credentials.json`
+2. **Sending dummy API requests** (`{"content": "hi", "max_tokens": 1}`) to `api.anthropic.com` solely to read the rate-limit response headers
+3. **Counting those dummy requests against your actual quota** — every refresh burns 1 message from your 5-hour and 7-day limits
+
+### Why this is risky
+
+- **The OAuth token in `~/.claude/.credentials.json` is Claude Code's internal credential**, not a personal API key. Using it in third-party scripts to make direct API calls is outside its intended purpose and likely violates [Anthropic's Terms of Service](https://www.anthropic.com/legal/consumer-terms).
+- **Automated dummy requests** purely to scrape response headers may be considered API abuse.
+- At the default 30-minute refresh interval, this generates **~48 dummy API calls per day**, all counted against your usage limits.
+
+### What is safe vs what is risky
+
+| Component | How it works | Safe? |
+|-----------|-------------|-------|
+| `claude-usage` CLI | Reads local `~/.claude/stats-cache.json` | ✅ Yes |
+| `claude-usage-status` (status bar) | Reads local files only between refreshes | ✅ Yes |
+| `claude-dashboard` | Reads local files only | ✅ Yes |
+| MCP `get_usage` tool | Reads local cache files | ✅ Yes |
+| `claude-fetch-limits` (API refresh) | Uses internal OAuth token + sends dummy requests | ⚠️ Risky |
+
+### Recommendation
+
+If you want to stay safe, **disable the automatic API refresh** and rely on locally cached data in `~/.claude/usage-limits.json`. The status bar and all tools work without the background refresh — they just display last known values from cache.
+
+To disable: remove the `claude-usage` MCP server entry from `~/.claude/settings.json`, or set a long interval via the `set_refresh` MCP tool.
 
 ---
 
@@ -10,7 +44,7 @@
 - **Live dashboard** — full-screen terminal TUI that refreshes automatically
 - **MCP plugin** — ask Claude "what's my usage?" and get instant stats inline
 - **Slash commands** — `/usage` and `/dashboard` inside Claude Code
-- **5h & 5-day limit bars** — real progress bars with countdown to reset
+- **5h & 7-day limit bars** — real progress bars with countdown to reset
 - **Cache hit rate** — see how efficiently your context is being reused
 - **Zero dependencies\*** — reads Claude's local stats files, no API calls, no internet
 
@@ -21,7 +55,7 @@
 ## Preview
 
 ```
-5h: 51% [█████░░░░░] rst:2h45m | 5d: 44% [████░░░░░░] rst:2d18h | msgs:44
+5h: 51% [█████░░░░░] rst:2h45m | 7d: 44% [████░░░░░░] rst:2d18h | msgs:44
 ```
 
 ```
@@ -31,7 +65,7 @@
 │  [████████░░░░░░░░░░░░░░] 48%     │    Input      : 42                 │
 │  Resets in: 2h 45m                │    Output     : 5.9K               │
 │                                   │    Cache read : 317.4K             │
-│  5-Day Window                     │    Cache write: 52.6K              │
+│  7-Day Window                     │    Cache write: 52.6K              │
 │  [█████████░░░░░░░░░░░░░] 44%     │    Cache hit  : ████████████ 85%   │
 │  Resets in: 2d 18h                │                                    │
 │                                   │  Totals                            │
@@ -79,19 +113,6 @@ Then **restart Claude Code** to activate the MCP server and status bar.
 
 ---
 
-## Configuration
-
-Default limits (Claude Code Pro approximate). Override in `~/.claude/settings.json`:
-
-```json
-"env": {
-  "CLAUDE_LIMIT_5H": "45",
-  "CLAUDE_LIMIT_5DAY": "225"
-}
-```
-
----
-
 ## How it works
 
 ```
@@ -115,7 +136,8 @@ claude-usage/
 │   ├── claude-usage          # one-shot & watch mode
 │   ├── claude-usage-status   # status bar script
 │   ├── claude-usage-mcp      # MCP server (JSON-RPC over stdio)
-│   └── claude-dashboard      # rich TUI dashboard
+│   ├── claude-dashboard      # rich TUI dashboard
+│   └── claude-fetch-limits   # ⚠️ API refresh (see warning above)
 ├── commands/
 │   ├── usage.md              # /usage slash command
 │   └── dashboard.md          # /dashboard slash command

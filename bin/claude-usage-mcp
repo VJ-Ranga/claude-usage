@@ -11,13 +11,24 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 
-STATS_FILE  = os.path.expanduser("~/.claude/stats-cache.json")
+STATS_FILE   = os.path.expanduser("~/.claude/stats-cache.json")
 HISTORY_FILE = os.path.expanduser("~/.claude/history.jsonl")
-DASHBOARD   = os.path.expanduser("~/.local/bin/claude-dashboard")
+LIMITS_FILE  = os.path.expanduser("~/.claude/usage-limits.json")
+CONFIG_FILE  = os.path.expanduser("~/.claude/usage-config.json")
+DASHBOARD    = os.path.expanduser("~/.local/bin/claude-dashboard")
 
-# Approximate Claude Code Pro limits — user can override via env
-LIMIT_5H  = int(os.environ.get("CLAUDE_LIMIT_5H",  "45"))
-LIMIT_5DAY = int(os.environ.get("CLAUDE_LIMIT_5DAY", "225"))
+DEFAULT_CONFIG = {"api_refresh_min": 30}
+VALID_INTERVALS = [5, 10, 15, 30, 60]
+
+def load_config():
+    try:
+        return {**DEFAULT_CONFIG, **json.load(open(CONFIG_FILE))}
+    except Exception:
+        return DEFAULT_CONFIG
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -63,12 +74,8 @@ def count_history_window(hours=None, days=None):
 TOOLS = [
     {
         "name": "get_usage",
-        "description": "Show Claude Code usage summary including daily activity, token counts, and progress toward 5-hour and 5-day limits.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
+        "description": "Show Claude Code usage summary including daily activity, token counts, and real limit percentages.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "launch_dashboard",
@@ -76,21 +83,41 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "interval": {
-                    "type": "integer",
-                    "description": "Refresh interval in seconds (default 30)",
-                    "default": 30
-                }
+                "interval": {"type": "integer", "description": "Refresh interval in seconds (default 30)", "default": 30}
             },
             "required": []
+        }
+    },
+    {
+        "name": "refresh_now",
+        "description": "Force an immediate fetch of real usage data from the Anthropic API and update the cache.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "set_refresh",
+        "description": "Set how often the status bar fetches real usage data from the Anthropic API. Default is 30 min. Valid options: 5, 10, 15, 30, 60 minutes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "minutes": {"type": "integer", "description": "Refresh interval in minutes (5, 10, 15, 30, or 60)", "default": 30}
+            },
+            "required": ["minutes"]
         }
     }
 ]
 
+def fmt_reset(secs):
+    if secs <= 0:
+        return "now"
+    h = int(secs // 3600)
+    m = int((secs % 3600) // 60)
+    if h >= 24:
+        d = h // 24
+        return f"{d}d{h%24}h"
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
 def tool_get_usage():
     data   = load_stats()
-    msgs5h  = count_history_window(hours=5)
-    msgs5d  = count_history_window(days=5)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     last  = data.get("lastComputedDate", "unknown")
@@ -99,11 +126,21 @@ def tool_get_usage():
     lines.append("━━━ Claude Code Usage ━━━")
     lines.append("")
 
-    # 5h / 5-day limits
-    lines.append("📊 Usage Limits")
-    lines.append(f"  5-hour  : {pct_bar(msgs5h,  LIMIT_5H)}")
-    lines.append(f"  5-day   : {pct_bar(msgs5d, LIMIT_5DAY)}")
-    lines.append(f"  (limits: {LIMIT_5H} msgs/5h · {LIMIT_5DAY} msgs/5day — set CLAUDE_LIMIT_5H / CLAUDE_LIMIT_5DAY to override)")
+    # Real 7d / 5h limits from API cache
+    try:
+        limits = json.load(open(LIMITS_FILE))
+        now = time.time()
+        pct5h = int(limits["5h"]["utilization"] * 100)
+        pct7d = int(limits["7d"]["utilization"] * 100)
+        rst5h = fmt_reset(limits["5h"]["reset"] - now)
+        rst7d = fmt_reset(limits["7d"]["reset"] - now)
+        age_min = int((now - limits["fetchedAt"]) / 60)
+        lines.append("📊 Usage Limits (live from API)")
+        lines.append(f"  5-hour : {pct_bar(pct5h, 100)}  resets in {rst5h}")
+        lines.append(f"  7-day  : {pct_bar(pct7d, 100)}  resets in {rst7d}")
+        lines.append(f"  (data fetched {age_min}m ago — run refresh_now to update)")
+    except Exception:
+        lines.append("📊 Usage Limits: run refresh_now to fetch from API")
     lines.append("")
 
     # Daily activity
