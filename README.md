@@ -4,49 +4,14 @@
 
 ---
 
-## ⚠️ IMPORTANT SECURITY & TERMS OF SERVICE WARNING ⚠️
-
-> **READ THIS BEFORE USING THE API REFRESH FEATURE**
-
-The `claude-fetch-limits` script works by:
-
-1. **Reading your internal Claude Code OAuth token** from `~/.claude/.credentials.json`
-2. **Sending dummy API requests** (`{"content": "hi", "max_tokens": 1}`) to `api.anthropic.com` solely to read the rate-limit response headers
-3. **Counting those dummy requests against your actual quota** — every refresh burns 1 message from your 5-hour and 7-day limits
-
-### Why this is risky
-
-- **The OAuth token in `~/.claude/.credentials.json` is Claude Code's internal credential**, not a personal API key. Using it in third-party scripts to make direct API calls is outside its intended purpose and likely violates [Anthropic's Terms of Service](https://www.anthropic.com/legal/consumer-terms).
-- **Automated dummy requests** purely to scrape response headers may be considered API abuse.
-- At the default 30-minute refresh interval, this generates **~48 dummy API calls per day**, all counted against your usage limits.
-
-### What is safe vs what is risky
-
-| Component | How it works | Safe? |
-|-----------|-------------|-------|
-| `claude-usage` CLI | Reads local `~/.claude/stats-cache.json` | ✅ Yes |
-| `claude-usage-status` (status bar) | Reads local files only between refreshes | ✅ Yes |
-| `claude-dashboard` | Reads local files only | ✅ Yes |
-| MCP `get_usage` tool | Reads local cache files | ✅ Yes |
-| `claude-fetch-limits` (API refresh) | Uses internal OAuth token + sends dummy requests | ⚠️ Risky |
-
-### Recommendation
-
-If you want to stay safe, **disable the automatic API refresh** and rely on locally cached data in `~/.claude/usage-limits.json`. The status bar and all tools work without the background refresh — they just display last known values from cache.
-
-To disable: remove the `claude-usage` MCP server entry from `~/.claude/settings.json`, or set a long interval via the `set_refresh` MCP tool.
-
----
-
 ## Features
 
 - **Status bar** — always-visible one-liner inside Claude Code showing limit % and reset times
 - **Live dashboard** — full-screen terminal TUI that refreshes automatically
-- **MCP plugin** — ask Claude "what's my usage?" and get instant stats inline
 - **Slash commands** — `/usage` and `/dashboard` inside Claude Code
 - **5h & 7-day limit bars** — real progress bars with countdown to reset
 - **Cache hit rate** — see how efficiently your context is being reused
-- **Zero dependencies\*** — reads Claude's local stats files, no API calls, no internet
+- **Zero dependencies\*** — reads Claude's local stats files by default
 
 > \* Dashboard requires `rich` (`pip install rich`), everything else is pure Python stdlib.
 
@@ -88,7 +53,7 @@ cd claude-usage
 source ~/.bash_aliases
 ```
 
-Then **restart Claude Code** to activate the MCP server and status bar.
+Then **restart Claude Code** to activate the status bar.
 
 ---
 
@@ -99,6 +64,7 @@ Then **restart Claude Code** to activate the MCP server and status bar.
 | Command | Description |
 |---|---|
 | `cu` | One-shot usage summary |
+| `cu --refresh` | Fetch live 5h/7d limit % from Anthropic API (manual) |
 | `cuw` | Auto-refreshing summary (every 30s) |
 | `claude-dashboard` | Full live TUI dashboard |
 | `claude-dashboard 60` | Dashboard with custom interval |
@@ -109,7 +75,22 @@ Then **restart Claude Code** to activate the MCP server and status bar.
 |---|---|
 | `/usage` | Claude shows your usage stats inline |
 | `/dashboard` | Claude opens the TUI in a new terminal |
-| Ask *"what's my usage?"* | Claude calls the tool automatically |
+
+---
+
+## API refresh — manual only
+
+By default, the status bar and CLI read from **local cache files only** — no API calls, no network, no tokens consumed.
+
+The 5h/7d limit percentages are cached from the last time you manually refreshed. Run this whenever you want a live reading:
+
+```bash
+claude-usage --refresh
+# or shorthand:
+cu -r
+```
+
+> **Note:** `--refresh` uses Claude Code's internal session token to make one real API call to `api.anthropic.com` and reads the rate-limit headers from the response. Use it consciously — it counts as one message against your quota. No automatic background polling happens.
 
 ---
 
@@ -124,6 +105,8 @@ Claude writes stats to ~/.claude/stats-cache.json
 claude-usage reads those files locally
        ↓
 Displays usage — no API calls, no internet, no tokens used
+
+(run  cu --refresh  any time you want live limit % from the API)
 ```
 
 ---
@@ -133,11 +116,10 @@ Displays usage — no API calls, no internet, no tokens used
 ```
 claude-usage/
 ├── bin/
-│   ├── claude-usage          # one-shot & watch mode
-│   ├── claude-usage-status   # status bar script
-│   ├── claude-usage-mcp      # MCP server (JSON-RPC over stdio)
+│   ├── claude-usage          # one-shot & watch mode  (--refresh for live data)
+│   ├── claude-usage-status   # status bar script (local cache only)
 │   ├── claude-dashboard      # rich TUI dashboard
-│   └── claude-fetch-limits   # ⚠️ API refresh (see warning above)
+│   └── claude-fetch-limits   # called by --refresh to hit the API
 ├── commands/
 │   ├── usage.md              # /usage slash command
 │   └── dashboard.md          # /dashboard slash command
