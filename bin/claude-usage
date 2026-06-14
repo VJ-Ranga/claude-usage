@@ -7,7 +7,9 @@ import sys
 import time
 from datetime import datetime, timezone
 
-STATS_FILE = os.path.expanduser("~/.claude/stats-cache.json")
+STATS_FILE   = os.path.expanduser("~/.claude/stats-cache.json")
+LIMITS_FILE  = os.path.expanduser("~/.claude/usage-limits.json")
+FETCHER      = os.path.expanduser("~/.local/bin/claude-fetch-limits")
 
 def fmt_tokens(n):
     if n >= 1_000_000:
@@ -71,9 +73,218 @@ def show(interval=None):
     print(f"\n  Stats last updated: {last_computed}")
     print("=" * 46)
 
+def refresh_from_api():
+    import subprocess
+    if not os.path.exists(FETCHER):
+        print("Error: claude-fetch-limits not found at", FETCHER)
+        return False
+    print("Fetching live limit data from Anthropic API...")
+    result = subprocess.run([sys.executable, FETCHER], capture_output=True, text=True)
+    if result.returncode == 0:
+        print(result.stdout.strip())
+        print()
+        return True
+    else:
+        print("Fetch failed:", result.stderr.strip())
+        return False
+
+def parse_status(text):
+    """Parse raw /status dialog text and save to usage-limits.json."""
+    import re
+
+    data = {"5h": {}, "7d": {}}
+    section = None
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "Current session" in stripped:
+            section = "5h"
+        elif "Current week" in stripped:
+            section = "7d"
+        elif section:
+            m = re.search(r'(\d+(?:\.\d+)?)\s*%\s+used', stripped)
+            if m:
+                data[section]["pct"] = float(m.group(1))
+            r = re.match(r'Resets\s+(.+)', stripped)
+            if r:
+                data[section]["reset_str"] = r.group(1).strip()
+
+    if not data["5h"].get("pct") and not data["7d"].get("pct"):
+        print("Could not find usage % in the pasted text.")
+        print("Make sure you copy the full /status output.")
+        return
+
+    # Parse reset time strings to Unix timestamps
+    def parse_reset(s):
+        if not s:
+            return None
+        # Extract timezone like "(Asia/Colombo)"
+        tz_match = re.search(r'\(([^)]+)\)', s)
+        tz_name = tz_match.group(1) if tz_match else "UTC"
+        s_clean = re.sub(r'\([^)]+\)', '', s).strip().rstrip(',').strip()
+        now = datetime.now()
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = timezone.utc
+        try:
+            # "Jun 15, 6:30pm" — date + time
+            dt = datetime.strptime(s_clean, "%b %d, %I:%M%p")
+            dt = dt.replace(year=now.year, tzinfo=tz)
+        except ValueError:
+            try:
+                # "3:30pm" — time only, assume today
+                dt = datetime.strptime(s_clean, "%I:%M%p")
+                dt = dt.replace(year=now.year, month=now.month, day=now.day, tzinfo=tz)
+            except ValueError:
+                return None
+        return int(dt.timestamp())
+
+    now = time.time()
+    try:
+        existing = json.load(open(LIMITS_FILE))
+    except Exception:
+        existing = {"5h": {}, "7d": {}}
+
+    existing["fetchedAt"] = int(now)
+    existing["source"] = "manual-parse"
+
+    hour_map = {"5h": 5, "7d": 24 * 7}
+    for key, info in data.items():
+        if not info.get("pct"):
+            continue
+        util = info["pct"] / 100
+        existing.setdefault(key, {})
+        existing[key]["utilization"] = util
+        existing[key]["source"] = "manual-parse"
+
+        rst = parse_reset(info.get("reset_str", ""))
+        if rst:
+            existing[key]["reset"] = rst
+
+        # Calibrate from local message count
+        hours = hour_map[key]
+        now_ms = now * 1000
+        cutoff = now_ms - hours * 3600 * 1000
+        try:
+            msgs = sum(1 for line in open(
+                os.path.expanduser("~/.claude/history.jsonl"))
+                if json.loads(line).get("timestamp", 0) >= cutoff)
+        except Exception:
+            msgs = 0
+        if util > 0.001 and msgs > 0:
+            existing[key]["msgsPerPct"] = msgs / (util * 100)
+            existing[key]["msgsAtFetch"] = msgs
+
+    with open(LIMITS_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    print("Parsed and saved:")
+    for key in ("5h", "7d"):
+        info = data.get(key, {})
+        if not info.get("pct"):
+            continue
+        e = existing[key]
+        cap = int(e.get("msgsPerPct", 0) * 100)
+        used = e.get("msgsAtFetch", "?")
+        rst_str = data[key].get("reset_str", "?")
+        print(f"  {key}: {info['pct']}%  (~{used}/{cap} msgs)  resets {rst_str}")
+    print()
+    print("Status bar updated.")
+
+def set_manual(args):
+    """Parse  --set 5h=33 7d=11  and write to usage-limits.json."""
+    parsed = {}
+    for arg in args:
+        for key in ("5h", "7d"):
+            if arg.startswith(key + "="):
+                try:
+                    val = float(arg.split("=", 1)[1].strip("%"))
+                    if not 0 <= val <= 100:
+                        raise ValueError
+                    parsed[key] = val / 100
+                except ValueError:
+                    print(f"Error: {arg} — value must be 0–100 (e.g. 5h=33)")
+                    return
+
+    if not parsed:
+        print("Usage: cu --set 5h=<pct> 7d=<pct>")
+        print("Example: cu --set 5h=33 7d=11")
+        print()
+        print("Read your % from https://claude.ai (account/settings) or the /status dialog,")
+        print("then enter them here. No API calls — 100% local after this.")
+        return
+
+    # Load existing data to preserve fields we're not updating
+    try:
+        existing = json.load(open(LIMITS_FILE))
+    except Exception:
+        existing = {"5h": {}, "7d": {}}
+
+    now = time.time()
+    for key, util in parsed.items():
+        existing.setdefault(key, {})["utilization"] = util
+        existing[key]["source"] = "manual"
+        # Calibrate msgsPerPct from current local message count
+        from datetime import timezone as tz
+        hours = 5 if key == "5h" else 24 * 7
+        now_ms = now * 1000
+        cutoff = now_ms - hours * 3600 * 1000
+        try:
+            msgs = sum(1 for line in open(
+                os.path.expanduser("~/.claude/history.jsonl"))
+                if json.loads(line).get("timestamp", 0) >= cutoff)
+        except Exception:
+            msgs = 0
+        if util > 0.001 and msgs > 0:
+            existing[key]["msgsPerPct"] = msgs / (util * 100)
+            existing[key]["msgsAtFetch"] = msgs
+
+    existing["fetchedAt"] = int(now)
+
+    with open(LIMITS_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    print("Saved manually entered limits:")
+    for key, util in parsed.items():
+        cap = int(existing[key].get("msgsPerPct", 0) * 100)
+        used = existing[key].get("msgsAtFetch", "?")
+        print(f"  {key}: {int(util*100)}%  (~{used}/{cap} msgs)")
+    print()
+    print("Status bar will update on next refresh.")
+
 def main():
     interval = None
+    do_refresh = False
     args = sys.argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print("Usage: claude-usage [options]")
+        print("  --parse              Paste /status dialog text, auto-extracts % and reset times")
+        print("  --set 5h=X 7d=X      Manually enter % from claude.ai (no API)")
+        print("  --refresh / -r       Fetch live % from Anthropic API (uses OAuth token)")
+        print("  --watch   / -w [N]   Auto-refresh display every N seconds (default 30)")
+        return
+
+    if args and args[0] == "--parse":
+        print("Paste your /status output below, then press Ctrl+D when done:")
+        print()
+        try:
+            text = sys.stdin.read()
+        except KeyboardInterrupt:
+            print("\nCancelled.")
+            return
+        parse_status(text)
+        return
+
+    if args and args[0] == "--set":
+        set_manual(args[1:])
+        return
+
+    if args and args[0] in ("-r", "--refresh"):
+        do_refresh = True
+        args = args[1:]
 
     if args and args[0] in ("-w", "--watch"):
         try:
@@ -81,12 +292,14 @@ def main():
         except ValueError:
             interval = 30
 
+    if do_refresh:
+        refresh_from_api()
+
     if interval:
         try:
             while True:
                 os.system("clear")
                 show(interval)
-                # countdown
                 for remaining in range(interval, 0, -1):
                     sys.stdout.write(f"\r  Next refresh in {remaining:2}s ... ")
                     sys.stdout.flush()
