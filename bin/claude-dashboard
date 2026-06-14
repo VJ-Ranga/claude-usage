@@ -15,9 +15,9 @@ from rich.table import Table
 from rich.text import Text
 
 STATS_FILE   = os.path.expanduser("~/.claude/stats-cache.json")
-HISTORY_FILE = os.path.expanduser("~/.claude/history.jsonl")
-LIMIT_5H     = int(os.environ.get("CLAUDE_LIMIT_5H",  "45"))
-LIMIT_5DAY   = int(os.environ.get("CLAUDE_LIMIT_5DAY", "225"))
+LIMITS_FILE  = os.path.expanduser("~/.claude/usage-limits.json")
+FETCHER      = os.path.expanduser("~/.local/bin/claude-fetch-limits")
+import subprocess
 
 console = Console()
 
@@ -33,34 +33,30 @@ def load_data():
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
-def window_data(hours=None, days=None):
-    now_ms = time.time() * 1000
-    cutoff = now_ms - (hours * 3600 if hours else days * 86400) * 1000
-    count, oldest = 0, None
+def load_limits():
     try:
-        with open(HISTORY_FILE) as f:
-            for line in f:
-                ts = json.loads(line).get("timestamp", 0)
-                if isinstance(ts, (int, float)) and ts >= cutoff:
-                    count += 1
-                    if oldest is None or ts < oldest:
-                        oldest = ts
+        return json.load(open(LIMITS_FILE))
+    except Exception:
+        return None
+
+def fetch_limits_bg():
+    try:
+        subprocess.Popen([sys.executable, FETCHER],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    return count, oldest
 
-def fmt_reset(oldest_ms, window_hours):
-    if oldest_ms is None:
-        return "clear"
-    secs_left = oldest_ms / 1000 + window_hours * 3600 - time.time()
-    if secs_left <= 0:
-        return "clear"
-    if window_hours >= 24:
-        d = int(secs_left // 86400)
-        h = int((secs_left % 86400) // 3600)
-        return f"{d}d {h}h" if d else f"{h}h {int((secs_left%3600)//60)}m"
-    h = int(secs_left // 3600)
-    m = int((secs_left % 3600) // 60)
+def fmt_reset(ts):
+    if not ts:
+        return "?"
+    secs = ts - time.time()
+    if secs <= 0:
+        return "now"
+    h = int(secs // 3600)
+    m = int((secs % 3600) // 60)
+    if h >= 24:
+        d = h // 24
+        return f"{d}d {h%24}h"
     return f"{h}h {m:02d}m" if h else f"{m}m"
 
 def limit_bar(used, total, width=24):
@@ -71,23 +67,31 @@ def limit_bar(used, total, width=24):
     bar    = f"[{color}]" + "█" * filled + f"[/][dim]" + "░" * (width - filled) + "[/]"
     return Text.from_markup(f"  {bar} [bold]{pct}%[/]  {used}/{total} msgs")
 
-def make_limits_panel(msgs5h, oldest5h, msgs5d, oldest5d):
-    r5h = fmt_reset(oldest5h, 5)
-    r5d = fmt_reset(oldest5d, 120)
+def make_limits_panel(limits):
+    if limits:
+        pct5h = int(limits["5h"]["utilization"] * 100)
+        pct7d = int(limits["7d"]["utilization"] * 100)
+        r5h   = fmt_reset(limits["5h"]["reset"])
+        r7d   = fmt_reset(limits["7d"]["reset"])
+        age   = int(time.time() - limits.get("fetchedAt", 0))
+        note  = f"[dim]Real data from Anthropic API · fetched {age}s ago[/]"
+    else:
+        pct5h = pct7d = 0
+        r5h = r7d = "?"
+        note = "[dim yellow]Fetching real data...[/]"
+
     content = Text.assemble(("5-Hour Window\n", "bold white"))
-    content.append_text(limit_bar(msgs5h, LIMIT_5H))
+    content.append_text(limit_bar(pct5h, 100))
     content.append(f"\n  Resets in: ", "dim")
     content.append(r5h, "bold yellow")
     content.append("\n\n")
-    content.append("5-Day Window\n", "bold white")
-    content.append_text(limit_bar(msgs5d, LIMIT_5DAY))
+    content.append("7-Day Window\n", "bold white")
+    content.append_text(limit_bar(pct7d, 100))
     content.append(f"\n  Resets in: ", "dim")
-    content.append(r5d, "bold yellow")
-    content.append(
-        f"\n\n[dim]Limits: {LIMIT_5H}/5h · {LIMIT_5DAY}/5day\n"
-        f"Set CLAUDE_LIMIT_5H / CLAUDE_LIMIT_5DAY to override[/]"
-    )
-    return Panel(content, title="[bold red]Usage Limits[/bold red]", border_style="red")
+    content.append(r7d, "bold yellow")
+    content.append(f"\n\n")
+    content.append_text(Text.from_markup(note))
+    return Panel(content, title="[bold red]Usage Limits (Real)[/bold red]", border_style="red")
 
 def make_activity_table(data):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -165,7 +169,7 @@ def make_header(interval, remaining):
         border_style="bright_blue",
     )
 
-def build_layout(data, msgs5h, oldest5h, msgs5d, oldest5d, interval, remaining):
+def build_layout(data, limits, interval, remaining):
     layout = Layout()
     layout.split_column(
         Layout(make_header(interval, remaining), size=3),
@@ -176,7 +180,7 @@ def build_layout(data, msgs5h, oldest5h, msgs5d, oldest5d, interval, remaining):
         Layout(name="right"),
     )
     layout["left"].split_column(
-        Layout(make_limits_panel(msgs5h, oldest5h, msgs5d, oldest5d), size=15),
+        Layout(make_limits_panel(limits), size=15),
         Layout(make_activity_table(data)),
     )
     layout["right"].split_column(
@@ -197,12 +201,12 @@ def main():
         console.print("[red]No Claude stats found.[/red]  Run Claude Code first.")
         sys.exit(1)
 
-    msgs5h, oldest5h = window_data(hours=5)
-    msgs5d, oldest5d = window_data(days=5)
+    limits = load_limits()
+    fetch_limits_bg()
 
     try:
         with Live(
-            build_layout(data, msgs5h, oldest5h, msgs5d, oldest5d, interval, interval),
+            build_layout(data, limits, interval, interval),
             refresh_per_second=1,
             screen=True,
         ) as live:
@@ -211,9 +215,9 @@ def main():
                 remaining = interval - (elapsed % interval)
                 if elapsed % interval == 0 and elapsed > 0:
                     data   = load_data() or data
-                    msgs5h, oldest5h = window_data(hours=5)
-                    msgs5d, oldest5d = window_data(days=5)
-                live.update(build_layout(data, msgs5h, oldest5h, msgs5d, oldest5d, interval, remaining))
+                    limits = load_limits()
+                    fetch_limits_bg()
+                live.update(build_layout(data, limits, interval, remaining))
                 time.sleep(1)
                 elapsed += 1
     except KeyboardInterrupt:

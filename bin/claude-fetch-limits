@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""
+Fetch real Claude usage limits from Anthropic API response headers.
+Makes a minimal API call and reads rate limit headers.
+Saves result to ~/.claude/usage-limits.json for other scripts to read.
+"""
+
+import json, os, time, urllib.request
+
+CREDS_FILE  = os.path.expanduser("~/.claude/.credentials.json")
+OUTPUT_FILE = os.path.expanduser("~/.claude/usage-limits.json")
+
+def fetch():
+    creds = json.load(open(CREDS_FILE))
+    token = creds["claudeAiOauth"]["accessToken"]
+
+    payload = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+    )
+
+    try:
+        res = urllib.request.urlopen(req, timeout=10)
+        headers = dict(res.headers)
+    except urllib.error.HTTPError as e:
+        headers = dict(e.headers)
+
+    def h(key):
+        return headers.get(key) or headers.get(key.lower())
+
+    result = {
+        "fetchedAt": int(time.time()),
+        "5h": {
+            "utilization": float(h("anthropic-ratelimit-unified-5h-utilization") or 0),
+            "reset":       int(h("anthropic-ratelimit-unified-5h-reset") or 0),
+            "status":      h("anthropic-ratelimit-unified-5h-status") or "unknown",
+        },
+        "7d": {
+            "utilization": float(h("anthropic-ratelimit-unified-7d-utilization") or 0),
+            "reset":       int(h("anthropic-ratelimit-unified-7d-reset") or 0),
+            "status":      h("anthropic-ratelimit-unified-7d-status") or "unknown",
+        },
+        "representative": h("anthropic-ratelimit-unified-representative-claim") or "",
+    }
+
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump(result, f, indent=2)
+
+    return result
+
+if __name__ == "__main__":
+    r = fetch()
+    print(f"5h:  {int(r['5h']['utilization']*100)}% used  reset: {time.strftime('%H:%M', time.localtime(r['5h']['reset']))}")
+    print(f"7d:  {int(r['7d']['utilization']*100)}% used  reset: {time.strftime('%a %H:%M', time.localtime(r['7d']['reset']))}")
